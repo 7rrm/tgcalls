@@ -1169,12 +1169,13 @@ struct DecodedBroadcastPart {
 class AudioDeviceDataObserverShared {
 public:
     AudioDeviceDataObserverShared(std::vector<float> *externalSendSamples, webrtc::Mutex *externalSendMutex, std::vector<float> *externalMonitorSamples, webrtc::Mutex *externalMonitorMutex,
-                                  bool *usesExternalAudioRecorder) :
+                                  bool *usesExternalAudioRecorder, const volatile bool *isMicMuted) :
     _externalSendSamples(externalSendSamples),
     _externalSendMutex(externalSendMutex),
     _externalMonitorSamples(externalMonitorSamples),
     _externalMonitorMutex(externalMonitorMutex),
-    _usesExternalAudioRecorder(usesExternalAudioRecorder) {
+    _usesExternalAudioRecorder(usesExternalAudioRecorder),
+    _isMicMuted(isMicMuted) {
     }
 
     ~AudioDeviceDataObserverShared() {
@@ -1214,12 +1215,21 @@ public:
         }
         _externalSendMutex->Lock();
         const size_t count = std::min(_externalSendSamples->size(), num_frames);
+        const bool micMuted = _isMicMuted != nullptr && *_isMicMuted;
         for (size_t i = 0; i < count; i++) {
             const int32_t value = (int32_t)(*_externalSendSamples)[i];
             for (size_t channel = 0; channel < num_channels; channel++) {
-                int32_t mixed = (int32_t)audio_samples[i * num_channels + channel] + value;
+                int32_t mixed = micMuted ? value : ((int32_t)audio_samples[i * num_channels + channel] + value);
                 mixed = std::max(-32768, std::min(32767, mixed));
                 audio_samples[i * num_channels + channel] = (int16_t)mixed;
+            }
+        }
+        if (micMuted) {
+            // The microphone is muted: never leak it, and keep the frames alive so the outgoing stream carries silence or the track.
+            for (size_t i = count; i < num_frames; i++) {
+                for (size_t channel = 0; channel < num_channels; channel++) {
+                    audio_samples[i * num_channels + channel] = 0;
+                }
             }
         }
         if (count > 0) {
@@ -1260,6 +1270,7 @@ private:
     std::vector<float> *_externalMonitorSamples = nullptr;
     webrtc::Mutex *_externalMonitorMutex = nullptr;
     bool *_usesExternalAudioRecorder = nullptr;
+    const volatile bool *_isMicMuted = nullptr;
 };
 
 class AudioDeviceDataObserverImpl : public webrtc::AudioDeviceDataObserver {
@@ -1575,7 +1586,7 @@ public:
     #endif
         }
 
-        _audioDeviceDataObserverShared = std::make_shared<AudioDeviceDataObserverShared>(&_externalAudioSamples, &_externalAudioSamplesMutex, &_externalMonitorSamples, &_externalMonitorSamplesMutex, &_usesExternalAudioRecorder);
+        _audioDeviceDataObserverShared = std::make_shared<AudioDeviceDataObserverShared>(&_externalAudioSamples, &_externalAudioSamplesMutex, &_externalMonitorSamples, &_externalMonitorSamplesMutex, &_usesExternalAudioRecorder, &_isMuted);
 
         _threads->getWorkerThread()->BlockingCall([this, isMuted = _isMuted]() mutable {
             _audioDeviceModule = createAudioDeviceModule();
@@ -3295,7 +3306,10 @@ public:
     void onUpdatedIsMuted() {
         if (_outgoingAudioChannel) {
             _threads->getWorkerThread()->BlockingCall([this]() {
-                _outgoingAudioChannel->send_channel()->SetAudioSend(_outgoingAudioSsrc, !_isMuted, nullptr, &_audioSource);
+                // Keep the outgoing channel enabled even while muted: the Joker voice broadcast replaces the
+                // microphone samples with the injected track (or silence) in the capture path, so everyone
+                // still hears the track while the user is muted.
+                _outgoingAudioChannel->send_channel()->SetAudioSend(_outgoingAudioSsrc, true, nullptr, &_audioSource);
 
                 if (_audioDeviceModule) {
                     bool isDeviceMuteAvailable = false;
@@ -3307,7 +3321,7 @@ public:
                 }
             });
 
-            _outgoingAudioChannel->Enable(!_isMuted);
+            _outgoingAudioChannel->Enable(true);
         } else {
             _threads->getWorkerThread()->BlockingCall([this]() {
                 if (_audioDeviceModule) {
