@@ -1171,7 +1171,14 @@ struct DecodedBroadcastPart {
 
 class AudioDeviceDataObserverShared {
 public:
-    AudioDeviceDataObserverShared() {
+    AudioDeviceDataObserverShared(std::vector<float> *externalSendSamples, webrtc::Mutex *externalSendMutex, std::vector<float> *externalMonitorSamples, webrtc::Mutex *externalMonitorMutex,
+                                  bool *usesExternalAudioRecorder, const volatile bool *isMicMuted) :
+    _externalSendSamples(externalSendSamples),
+    _externalSendMutex(externalSendMutex),
+    _externalMonitorSamples(externalMonitorSamples),
+    _externalMonitorMutex(externalMonitorMutex),
+    _usesExternalAudioRecorder(usesExternalAudioRecorder),
+    _isMicMuted(isMicMuted) {
     }
 
     ~AudioDeviceDataObserverShared() {
@@ -1195,10 +1202,78 @@ public:
         }
     }
 
+    void mixCaptureAudio(int16_t *audio_samples, const size_t num_frames, const size_t num_channels, const uint32_t samples_per_sec) {
+        // Mix the externally injected samples into the microphone capture so
+        // everyone in the call hears the track. This is a normal group call
+        // (not a screencast), so the external samples are not consumed
+        // anywhere else. The mix happens after the voice processing audio
+        // unit, so the injected audio bypasses noise suppression and AGC.
+        if (!_externalSendSamples || !_externalSendMutex) {
+            return;
+        }
+        if (_usesExternalAudioRecorder && *_usesExternalAudioRecorder) {
+            // A FakeAudioDeviceModule already sends the samples as the only
+            // microphone source; don't mix them a second time.
+            return;
+        }
+        _externalSendMutex->Lock();
+        const size_t count = std::min(_externalSendSamples->size(), num_frames);
+        const bool micMuted = _isMicMuted != nullptr && *_isMicMuted;
+        for (size_t i = 0; i < count; i++) {
+            const int32_t value = (int32_t)(*_externalSendSamples)[i];
+            for (size_t channel = 0; channel < num_channels; channel++) {
+                int32_t mixed = micMuted ? value : ((int32_t)audio_samples[i * num_channels + channel] + value);
+                mixed = std::max(-32768, std::min(32767, mixed));
+                audio_samples[i * num_channels + channel] = (int16_t)mixed;
+            }
+        }
+        if (micMuted) {
+            // The microphone is muted: never leak it, and keep the frames alive so the outgoing stream carries silence or the track.
+            for (size_t i = count; i < num_frames; i++) {
+                for (size_t channel = 0; channel < num_channels; channel++) {
+                    audio_samples[i * num_channels + channel] = 0;
+                }
+            }
+        }
+        if (count > 0) {
+            _externalSendSamples->erase(_externalSendSamples->begin(), _externalSendSamples->begin() + (long)count);
+        }
+        _externalSendMutex->Unlock();
+    }
+
+    void mixRenderAudio(int16_t *audio_samples, const size_t num_frames, const size_t num_channels, const uint32_t samples_per_sec) {
+        // The sender does not hear their own injected audio, so play the
+        // same track locally by mixing it into the render path, at the same
+        // volume as the other participants' voices.
+        if (!_externalMonitorSamples || !_externalMonitorMutex) {
+            return;
+        }
+        _externalMonitorMutex->Lock();
+        const size_t count = std::min(_externalMonitorSamples->size(), num_frames);
+        for (size_t i = 0; i < count; i++) {
+            const int32_t value = (int32_t)(*_externalMonitorSamples)[i];
+            for (size_t channel = 0; channel < num_channels; channel++) {
+                int32_t mixed = (int32_t)audio_samples[i * num_channels + channel] + value;
+                mixed = std::max(-32768, std::min(32767, mixed));
+                audio_samples[i * num_channels + channel] = (int16_t)mixed;
+            }
+        }
+        if (count > 0) {
+            _externalMonitorSamples->erase(_externalMonitorSamples->begin(), _externalMonitorSamples->begin() + (long)count);
+        }
+        _externalMonitorMutex->Unlock();
+    }
+
 private:
     webrtc::Mutex _mutex;
     StreamingAudioRenderer _renderer;
     std::shared_ptr<StreamingMediaContext> _streamingContext;
+    std::vector<float> *_externalSendSamples = nullptr;
+    webrtc::Mutex *_externalSendMutex = nullptr;
+    std::vector<float> *_externalMonitorSamples = nullptr;
+    webrtc::Mutex *_externalMonitorMutex = nullptr;
+    bool *_usesExternalAudioRecorder = nullptr;
+    const volatile bool *_isMicMuted = nullptr;
 };
 
 class AudioDeviceDataObserverImpl : public webrtc::AudioDeviceDataObserver {
@@ -1215,6 +1290,16 @@ public:
                                const size_t bytes_per_sample,
                                const size_t num_channels,
                                const uint32_t samples_per_sec) override {
+        if (bytes_per_sample != num_channels * 2) {
+            return;
+        }
+        if (_shared) {
+            _shared->mixCaptureAudio(
+                const_cast<int16_t *>(static_cast<const int16_t *>(audio_samples)),
+                num_samples,
+                num_channels,
+                samples_per_sec);
+        }
     }
 
     virtual void OnRenderData(const void* audio_samples,
@@ -1233,6 +1318,7 @@ public:
         }
 
         if (_shared) {
+            _shared->mixRenderAudio(const_cast<int16_t *>(static_cast<const int16_t *>(audio_samples)), num_samples, num_channels, samples_per_sec);
             _shared->mixAudio((int16_t *)audio_samples, num_samples, num_channels, samples_per_sec);
         }
     }
@@ -1503,7 +1589,7 @@ public:
     #endif
         }
 
-        _audioDeviceDataObserverShared = std::make_shared<AudioDeviceDataObserverShared>();
+        _audioDeviceDataObserverShared = std::make_shared<AudioDeviceDataObserverShared>(&_externalAudioSamples, &_externalAudioSamplesMutex, &_externalMonitorSamples, &_externalMonitorSamplesMutex, &_usesExternalAudioRecorder, &_isMuted);
 
         _threads->getWorkerThread()->BlockingCall([this, isMuted = _isMuted]() mutable {
             _audioDeviceModule = createAudioDeviceModule();
@@ -3076,15 +3162,24 @@ public:
             return;
         }
         _externalAudioSamplesMutex.Lock();
+        _externalMonitorSamplesMutex.Lock();
 
         size_t previousSize = _externalAudioSamples.size();
-        _externalAudioSamples.resize(_externalAudioSamples.size() + samples.size() / 2);
-        webrtc::S16ToFloatS16((const int16_t *)samples.data(), samples.size() / 2, _externalAudioSamples.data() + previousSize);
+        size_t previousMonitorSize = _externalMonitorSamples.size();
+        size_t sampleCount = samples.size() / 2;
+        _externalAudioSamples.resize(previousSize + sampleCount);
+        _externalMonitorSamples.resize(previousMonitorSize + sampleCount);
+        webrtc::S16ToFloatS16((const int16_t *)samples.data(), sampleCount, _externalAudioSamples.data() + previousSize);
+        webrtc::S16ToFloatS16((const int16_t *)samples.data(), sampleCount, _externalMonitorSamples.data() + previousMonitorSize);
 
         if (_externalAudioSamples.size() > 2 * 48000) {
             _externalAudioSamples.erase(_externalAudioSamples.begin(), _externalAudioSamples.begin() + (_externalAudioSamples.size() - 2 * 48000));
         }
+        if (_externalMonitorSamples.size() > 2 * 48000) {
+            _externalMonitorSamples.erase(_externalMonitorSamples.begin(), _externalMonitorSamples.begin() + (_externalMonitorSamples.size() - 2 * 48000));
+        }
 
+        _externalMonitorSamplesMutex.Unlock();
         _externalAudioSamplesMutex.Unlock();
     }
 
@@ -3214,7 +3309,10 @@ public:
     void onUpdatedIsMuted() {
         if (_outgoingAudioChannel) {
             _threads->getWorkerThread()->BlockingCall([this]() {
-                _outgoingAudioChannel->send_channel()->SetAudioSend(_outgoingAudioSsrc, !_isMuted, nullptr, &_audioSource);
+                // Keep the outgoing channel enabled even while muted: the Joker voice broadcast replaces the
+                // microphone samples with the injected track (or silence) in the capture path, so everyone
+                // still hears the track while the user is muted.
+                _outgoingAudioChannel->send_channel()->SetAudioSend(_outgoingAudioSsrc, true, nullptr, &_audioSource);
 
                 if (_audioDeviceModule) {
                     bool isDeviceMuteAvailable = false;
@@ -3226,7 +3324,7 @@ public:
                 }
             });
 
-            _outgoingAudioChannel->Enable(!_isMuted);
+            _outgoingAudioChannel->Enable(true);
         } else {
             _threads->getWorkerThread()->BlockingCall([this]() {
                 if (_audioDeviceModule) {
@@ -3752,6 +3850,10 @@ private:
     std::vector<float> _externalAudioSamples;
     webrtc::Mutex _externalAudioSamplesMutex;
     std::shared_ptr<ExternalAudioRecorder> _externalAudioRecorder;
+    // Keep a second copy of the same samples for local playout (the capture
+    // path drains its copy onto the network; the sender does not hear it).
+    std::vector<float> _externalMonitorSamples;
+    webrtc::Mutex _externalMonitorSamplesMutex;
     // Set by createAudioDeviceModule() when the FakeAudioDeviceModule driven by
     // _externalAudioRecorder is the audio device, i.e. it is the sole consumer of
     // _externalAudioSamples.
