@@ -1,3 +1,5 @@
+#include "modules/audio_device/include/audio_device_data_observer.h"
+#include "group/JokerAudioRecorder.h"
 #include "v2/InstanceV2CompatImpl.h"
 
 #include "LogSinkImpl.h"
@@ -72,6 +74,47 @@
 
 #include "third-party/json11.hpp"
 #include "utils/gzip.h"
+
+namespace {
+
+class JokerAudioDeviceObserverImpl : public webrtc::AudioDeviceDataObserver {
+public:
+    JokerAudioDeviceObserverImpl() {
+    }
+
+    virtual ~JokerAudioDeviceObserverImpl() {
+    }
+
+    virtual void OnCaptureData(const void* audio_samples,
+                               const size_t num_samples,
+                               const size_t bytes_per_sample,
+                               const size_t num_channels,
+                               const uint32_t samples_per_sec) override {
+        if (bytes_per_sample != num_channels * 2) {
+            return;
+        }
+        if (!tgcalls::JokerAudioRecorder::Instance().isSet()) {
+            return;
+        }
+        tgcalls::JokerAudioRecorder::Instance().onCapture(static_cast<const int16_t *>(audio_samples), num_samples, num_channels, samples_per_sec);
+    }
+
+    virtual void OnRenderData(const void* audio_samples,
+                              const size_t num_samples,
+                              const size_t bytes_per_sample,
+                              const size_t num_channels,
+                              const uint32_t samples_per_sec) override {
+        if (bytes_per_sample != num_channels * 2) {
+            return;
+        }
+        if (!tgcalls::JokerAudioRecorder::Instance().isSet()) {
+            return;
+        }
+        tgcalls::JokerAudioRecorder::Instance().onRender(static_cast<const int16_t *>(audio_samples), num_samples, num_channels, samples_per_sec);
+    }
+};
+
+}  // namespace
 
 namespace tgcalls {
 namespace {
@@ -2026,9 +2069,14 @@ private:
         const auto check = [&](const webrtc::scoped_refptr<webrtc::AudioDeviceModule> &result) {
             return (result && result->Init() == 0) ? result : nullptr;
         };
-        if (_createWrappedAudioDeviceModule) {
+                if (_createWrappedAudioDeviceModule) {
             auto result = _createWrappedAudioDeviceModule(_taskQueueFactory.get());
             if (result) {
+                auto audioDeviceObserver = std::make_unique<JokerAudioDeviceObserverImpl>();
+                auto moduleWithObserver = webrtc::CreateAudioDeviceWithDataObserver(result, std::move(audioDeviceObserver));
+                if (moduleWithObserver) {
+                    return rtc::make_ref_counted<tgcalls::DefaultWrappedAudioDeviceModule>(moduleWithObserver);
+                }
                 return result;
             }
         }

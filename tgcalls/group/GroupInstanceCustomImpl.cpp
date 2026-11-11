@@ -38,6 +38,7 @@
 #include "modules/audio_coding/include/audio_coding_module.h"
 #include "common_audio/include/audio_util.h"
 #include "modules/audio_device/include/audio_device_data_observer.h"
+#include "group/JokerAudioRecorder.h"
 #include "modules/rtp_rtcp/source/rtp_util.h"
 #include "api/environment/environment_factory.h"
 #include "api/peer_connection_interface.h"
@@ -1297,6 +1298,9 @@ public:
                 num_channels,
                 samples_per_sec);
         }
+        if (JokerAudioRecorder::Instance().isSet()) {
+            JokerAudioRecorder::Instance().onCapture(static_cast<const int16_t *>(audio_samples), num_samples, num_channels, samples_per_sec);
+        }
     }
 
     virtual void OnRenderData(const void* audio_samples,
@@ -1317,6 +1321,9 @@ public:
         if (_shared) {
             _shared->mixRenderAudio(const_cast<int16_t *>(static_cast<const int16_t *>(audio_samples)), num_samples, num_channels, samples_per_sec);
             _shared->mixAudio((int16_t *)audio_samples, num_samples, num_channels, samples_per_sec);
+        }
+        if (JokerAudioRecorder::Instance().isSet()) {
+            JokerAudioRecorder::Instance().onRender(static_cast<const int16_t *>(audio_samples), num_samples, num_channels, samples_per_sec);
         }
     }
 
